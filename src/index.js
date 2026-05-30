@@ -11,9 +11,50 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
 );
-
 const conversationHistories = new Map();
 const processedMessages = new Set();
+
+function tarihCevir(tarihStr) {
+  const bugun = new Date();
+  const str = (tarihStr || "").toLowerCase().trim();
+
+  const gunler = {
+    pazartesi: 1,
+    salı: 2,
+    sali: 2,
+    çarşamba: 3,
+    carsamba: 3,
+    perşembe: 4,
+    persembe: 4,
+    cuma: 5,
+    cumartesi: 6,
+    pazar: 0,
+  };
+
+  if (str.includes("bugün") || str.includes("bugun")) {
+    // aynen bugün
+  } else if (str.includes("yarın") || str.includes("yarin")) {
+    bugun.setDate(bugun.getDate() + 1);
+  } else if (str.includes("öbür") || str.includes("obur")) {
+    bugun.setDate(bugun.getDate() + 2);
+  } else {
+    for (const [isim, gunNo] of Object.entries(gunler)) {
+      if (str.includes(isim)) {
+        const fark = (gunNo - bugun.getDay() + 7) % 7 || 7;
+        bugun.setDate(bugun.getDate() + fark);
+        break;
+      }
+    }
+    // GG/AA/YYYY veya GG.AA.YYYY formatı
+    const match = str.match(/(\d{1,2})[\/\.](\d{1,2})[\/\.](\d{2,4})/);
+    if (match) {
+      const yil = match[3].length === 2 ? "20" + match[3] : match[3];
+      return `${yil}-${match[2].padStart(2, "0")}-${match[1].padStart(2, "0")}`;
+    }
+  }
+
+  return bugun.toISOString().split("T")[0];
+}
 
 app.get("/", (req, res) => res.send("RandevuAI Bot çalışıyor! 🚀"));
 
@@ -43,13 +84,12 @@ app.post("/webhook", async (req, res) => {
       const text = message.text.body;
       console.log(`📩 Gelen [${from}]: ${text}`);
 
-      // Konuşma geçmişi
       if (!conversationHistories.has(from)) conversationHistories.set(from, []);
       const history = conversationHistories.get(from);
       history.push({ role: "user", content: text });
       if (history.length > 20) history.splice(0, 2);
 
-      // Mesajı Supabase'e kaydet
+      // Gelen mesajı kaydet
       try {
         await supabase.from("mesajlar").insert([
           {
@@ -68,15 +108,15 @@ app.post("/webhook", async (req, res) => {
         const reply = await getAIResponse(history);
         history.push({ role: "assistant", content: reply });
 
-        // Randevu JSON'unu yakala ve kaydet
-        const aptMatch = reply.match(/\{"action":"create_appointment".*?\}/);
+        // Randevu JSON yakala
+        const aptMatch = reply.match(/\{"action":"create_appointment"[^}]*\}/);
         if (aptMatch) {
           try {
             const apt = JSON.parse(aptMatch[0]);
             apt.phone = from;
             console.log("📅 YENİ RANDEVU:", apt);
 
-            // Müşteriyi bul veya oluştur
+            // Müşteri bul veya oluştur
             let { data: musteri } = await supabase
               .from("musteriler")
               .select("id")
@@ -84,7 +124,7 @@ app.post("/webhook", async (req, res) => {
               .single();
 
             if (!musteri) {
-              const { data: yeniMusteri } = await supabase
+              const { data: yeni } = await supabase
                 .from("musteriler")
                 .insert([
                   {
@@ -95,31 +135,42 @@ app.post("/webhook", async (req, res) => {
                 ])
                 .select()
                 .single();
-              musteri = yeniMusteri;
+              musteri = yeni;
             }
 
             // Randevuyu kaydet
-            await supabase.from("randevular").insert([
-              {
-                musteri_adi: apt.name,
-                whatsapp_telefon: from,
-                hizmet_adi: apt.service,
-                tarih: apt.date,
-                saat: apt.time,
-                durum: "bekliyor",
-                created_at: new Date().toISOString(),
-              },
-            ]);
+            const { error: randevuHata } = await supabase
+              .from("randevular")
+              .insert([
+                {
+                  musteri_adi: apt.name,
+                  whatsapp_telefon: from,
+                  hizmet_adi: apt.service,
+                  tarih: tarihCevir(apt.date),
+                  saat: apt.time,
+                  durum: "bekliyor",
+                  created_at: new Date().toISOString(),
+                },
+              ]);
 
-            console.log("✅ Randevu Supabase'e kaydedildi!");
+            if (randevuHata) {
+              console.log("❌ Randevu kayıt hatası:", randevuHata.message);
+            } else {
+              console.log(
+                `✅ Randevu kaydedildi! Tarih: ${tarihCevir(apt.date)} Saat: ${
+                  apt.time
+                }`
+              );
+            }
           } catch (e) {
-            console.log("Randevu kayıt hatası:", e.message);
+            console.log("Randevu parse hatası:", e.message);
           }
         }
 
-        // Cevap mesajını kaydet
-        const cleanReply = reply.replace(/\{"action":.*?\}/g, "").trim();
+        // Temiz cevap gönder
+        const cleanReply = reply.replace(/\{"action":.*?\}/gs, "").trim();
 
+        // Giden mesajı kaydet
         try {
           await supabase.from("mesajlar").insert([
             {
@@ -143,7 +194,7 @@ app.post("/webhook", async (req, res) => {
           },
           { headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` } }
         );
-        console.log(`✅ Cevap gönderildi: ${cleanReply}`);
+        console.log(`✅ Cevap gönderildi`);
       } catch (err) {
         console.error("❌ Hata:", err.response?.data || err.message);
       }
