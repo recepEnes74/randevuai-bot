@@ -49,6 +49,7 @@ ASLA:
 
 async function getAIResponse(conversationHistory) {
   const completion = await groq.chat.completions.create({
+    
     messages: [
       { role: "system", content: SYSTEM_PROMPT },
       ...conversationHistory,

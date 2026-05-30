@@ -1,18 +1,21 @@
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
+const { createClient } = require("@supabase/supabase-js");
 const { getAIResponse } = require("./gemini");
-const app = express();
 
+const app = express();
 app.use(express.json());
 
-// Konuşma geçmişi - her müşteri için ayrı
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_KEY
+);
+
 const conversationHistories = new Map();
 const processedMessages = new Set();
 
-app.get("/", (req, res) => {
-  res.send("RandevuAI Bot çalışıyor! 🚀");
-});
+app.get("/", (req, res) => res.send("RandevuAI Bot çalışıyor! 🚀"));
 
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
@@ -40,37 +43,96 @@ app.post("/webhook", async (req, res) => {
       const text = message.text.body;
       console.log(`📩 Gelen [${from}]: ${text}`);
 
-      // Konuşma geçmişini al veya oluştur
-      if (!conversationHistories.has(from)) {
-        conversationHistories.set(from, []);
-      }
+      // Konuşma geçmişi
+      if (!conversationHistories.has(from)) conversationHistories.set(from, []);
       const history = conversationHistories.get(from);
-
-      // Kullanıcı mesajını geçmişe ekle
       history.push({ role: "user", content: text });
-
-      // Son 20 mesajı tut (bellek yönetimi)
       if (history.length > 20) history.splice(0, 2);
+
+      // Mesajı Supabase'e kaydet
+      try {
+        await supabase.from("mesajlar").insert([
+          {
+            whatsapp_telefon: from,
+            yon: "gelen",
+            icerik: text,
+            mesaj_tipi: "text",
+            created_at: new Date().toISOString(),
+          },
+        ]);
+      } catch (e) {
+        console.log("Mesaj kayıt hatası:", e.message);
+      }
 
       try {
         const reply = await getAIResponse(history);
-
-        // Asistan cevabını geçmişe ekle
         history.push({ role: "assistant", content: reply });
 
-        // Randevu JSON'unu yakala
-        const appointmentMatch = reply.match(
-          /\{"action":"create_appointment".*?\}/
-        );
-        if (appointmentMatch) {
-          const appointment = JSON.parse(appointmentMatch[0]);
-          appointment.phone = from;
-          console.log("📅 YENİ RANDEVU:", appointment);
-          // TODO: Google Calendar entegrasyonu buraya gelecek
+        // Randevu JSON'unu yakala ve kaydet
+        const aptMatch = reply.match(/\{"action":"create_appointment".*?\}/);
+        if (aptMatch) {
+          try {
+            const apt = JSON.parse(aptMatch[0]);
+            apt.phone = from;
+            console.log("📅 YENİ RANDEVU:", apt);
+
+            // Müşteriyi bul veya oluştur
+            let { data: musteri } = await supabase
+              .from("musteriler")
+              .select("id")
+              .eq("whatsapp_telefon", from)
+              .single();
+
+            if (!musteri) {
+              const { data: yeniMusteri } = await supabase
+                .from("musteriler")
+                .insert([
+                  {
+                    whatsapp_telefon: from,
+                    ad: apt.name || "Müşteri",
+                    created_at: new Date().toISOString(),
+                  },
+                ])
+                .select()
+                .single();
+              musteri = yeniMusteri;
+            }
+
+            // Randevuyu kaydet
+            await supabase.from("randevular").insert([
+              {
+                musteri_adi: apt.name,
+                whatsapp_telefon: from,
+                hizmet_adi: apt.service,
+                tarih: apt.date,
+                saat: apt.time,
+                durum: "bekliyor",
+                created_at: new Date().toISOString(),
+              },
+            ]);
+
+            console.log("✅ Randevu Supabase'e kaydedildi!");
+          } catch (e) {
+            console.log("Randevu kayıt hatası:", e.message);
+          }
         }
 
-        // Temiz mesaj gönder (JSON kısmını çıkar)
+        // Cevap mesajını kaydet
         const cleanReply = reply.replace(/\{"action":.*?\}/g, "").trim();
+
+        try {
+          await supabase.from("mesajlar").insert([
+            {
+              whatsapp_telefon: from,
+              yon: "giden",
+              icerik: cleanReply,
+              mesaj_tipi: "text",
+              created_at: new Date().toISOString(),
+            },
+          ]);
+        } catch (e) {
+          console.log("Cevap kayıt hatası:", e.message);
+        }
 
         await axios.post(
           `https://graph.facebook.com/v18.0/${process.env.PHONE_NUMBER_ID}/messages`,
